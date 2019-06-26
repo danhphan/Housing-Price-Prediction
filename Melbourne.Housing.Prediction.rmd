@@ -1,0 +1,653 @@
+---
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r}
+# Clear old virables
+rm(list=ls())
+gc()
+
+# Load related libraries
+library(ggplot2)
+library(leaps)
+library(corrplot)
+
+encode_categorical <- function(train)
+{
+  for(i in names(train))
+  {
+
+    if(class(train[,i]) == "factor")
+    {
+      indicators <- model.matrix(~train[,i] - 1, data=train)
+      colnames(indicators) <- paste(i,levels(train[,i]), sep = "_") 
+      train <- cbind(train,indicators)
+      train[,i] <- NULL
+    }
+    
+  }
+  return(train)
+}
+
+predict.regsubsets = function(object, newdata, id, ...) {
+    form = as.formula(object$call[[2]])
+    mat = model.matrix(form, newdata)
+    coefi = coef(object, id = id)
+    mat[, names(coefi)] %*% coefi
+}
+
+
+```
+
+# DATA PREPARATION
+```{r}
+
+# Read data
+melhouse <- read.csv(file="cleaned_melbourn_housing_data.csv",header = TRUE)
+
+dim(melhouse)
+summary(melhouse)
+
+# Get sold year 
+melhouse$Date <- as.Date(melhouse$Date,format="%d/%m/%Y")
+melhouse$Year <- as.numeric(format(melhouse$Date,"%Y"))
+
+# Check Price distribution
+hist(melhouse$Price,xlab="Price",main="Histogram of Price",breaks = 30,col = "green")
+hist(log(melhouse$Price),xlab="log(Price)",main="Histogram of log(Price)",breaks = 30,col = "green")
+
+# Time series
+ggplot(data = melhouse, aes(x = Date, y = Price))+
+  geom_line(color = "#00AFBB", size = 2)
+
+p <- ggplot(melhouse, aes(x = Date, y = Price)) + 
+  geom_point(aes(color = Type), size = 1) +
+  scale_color_manual(values = c("black", "green","blue")) +
+  theme_minimal()
+p + scale_x_date(date_labels = "%b/%Y") + 
+  stat_smooth( color = "#FC4E07", fill = "#FC4E07",
+  method = "loess")
+
+
+
+####### CHECK CORRELATION
+numeric_list <- lapply(melhouse,class) %in% c("numeric","integer")
+numeric_list
+corr <- cor(melhouse[,numeric_list])
+corrplot(corr,order="hclust")
+
+summary(melhouse[,numeric_list])
+summary(melhouse[,!numeric_list])
+
+# Select related features for regession 
+list_features <- c("Price" ,"Rooms", "Bathroom","Car","Distance","Landsize",
+              "Propertycount","Lattitude","Longtitude", "Year", "Type")  #"Type"
+
+# Train data set (80%), and test data set (20%)
+set.seed(9999)
+train.rows = sample(1:nrow(melhouse), nrow(melhouse)*0.8)
+
+# Test data will use to evaluate all model.
+# Test data will not be used for atribute filtering or model fitting
+mhouse.test <- melhouse[-train.rows,list_features]
+mhouse.test$Type <- as.numeric(mhouse.test$Type)
+
+# Train data will be use for atribute filtering or model fitting
+mhouse <- melhouse[train.rows,list_features]
+mhouse$Type <- as.numeric(mhouse$Type)
+
+
+# Get data for PCA
+mhouse.testX <- mhouse.test
+mhouse.trainX <- mhouse
+
+
+```
+
+## ATTRIBUTE SELECTION USING STEPWISE
+# Using a validation set
+```{r}
+# Train data set (80%), and validation data set (20%)
+set.seed(12345)
+train.rows = sample(1:nrow(mhouse), nrow(mhouse)*0.8)
+
+dim(mhouse[train.rows,])
+dim(mhouse[-train.rows,])
+
+(model.no <- ncol(mhouse) -1)
+
+regfit.forward <- regsubsets(log(Price)~.,data=mhouse[train.rows,],nvmax=model.no, method = "forward")
+# Plot predictor importance
+names(summary(regfit.forward))
+plot(regfit.forward, scale ="bic",col = "green")
+plot(regfit.forward, scale ="bic")
+# Record error
+regfit.forward$rss
+eval.errors = rep(NA, model.no)
+x.test = model.matrix(log(Price) ~ ., data = mhouse[-train.rows,])  # notice the -index!
+
+for (i in 1:model.no) {
+    coefi = coef(regfit.forward, id = i)
+    pred = x.test[, names(coefi)] %*% coefi
+    eval.errors[i] = mean((log(mhouse$Price[-train.rows]) - pred)^2)
+    
+}
+# Five predictors
+coef(regfit.forward,5)[-1]
+ #      Rooms    Distance   Lattitude  Longtitude        Type 
+ # 0.23291715 -0.04111367 -1.45746594  1.02076233 -0.26607856 
+
+
+{plot(sqrt(eval.errors), ylab = "Root MSE", pch = 19, type = "b",ylim = c(0.3,0.45))
+points(sqrt(regfit.forward$rss[-1]/nrow(mhouse[train.rows,])), col = "blue", pch = 19, type = "b")
+legend("topright", legend = c("Training", "Validation"), col = c("blue", "black"), pch = 19)}
+
+
+```
+
+# Using cross-validation
+```{r, fig.height=4, fig.width=4}
+
+set.seed(12345)
+folds = sample(rep(1:10, length = nrow(mhouse)))
+table(folds)
+
+cv.errors = matrix(NA, 10, model.no)
+for (k in 1:10) {
+    best.fit = regsubsets(log(Price) ~ ., data = mhouse[folds != k, ], nvmax = model.no, method = "forward")
+    for (i in 1:model.no) {
+        pred = predict(best.fit, mhouse[folds == k, ], id = i)
+        cv.errors[k, i] = mean((log(mhouse$Price[folds == k]) - pred)^2)
+    }
+}
+
+# Five predictors 
+coef(best.fit,5)[-1]
+ #      Rooms    Distance   Lattitude  Longtitude        Type 
+ # 0.23220051 -0.04034924 -1.46079178  0.99114771 -0.26600306 
+
+rmse.cv = sqrt(apply(cv.errors, 2, mean))
+{plot(sqrt(eval.errors), ylab = "Root MSE", pch = 19, type = "b",ylim = c(0.3,0.45))
+points(rmse.cv, pch = 19, type = "b",col = "green")
+legend("topright", legend = c("Validation Set","Cross-Validation"), col = c("black","green"), pch = 19)}
+
+
+```
+
+## ATTRIBUTE SELECTION USING LASSO
+
+```{r}
+library(glmnet)
+
+# Train data set (80%), and validation data set (20%)
+set.seed(11111)
+train.rows = sample(1:nrow(mhouse), nrow(mhouse)*0.8)
+
+dim(mhouse[train.rows,])
+dim(mhouse[-train.rows,])
+
+train.x <- model.matrix(log(Price)~., data=mhouse[train.rows,])[,-1] # Drop intercept
+train.y <- log(melhouse[train.rows,]$Price)
+
+test.x <- model.matrix(log(Price)~., data=mhouse[-train.rows,])[,-1] # Drop intercept
+test.y <- log(melhouse[-train.rows,]$Price)
+
+# Fit lasso
+fit.lasso = glmnet(train.x, train.y, alpha = 1)
+plot(fit.lasso, xvar = "lambda", label = TRUE)
+
+# Using 10 folds cross-validation to tune lambda
+set.seed(11111)
+cv.lasso <- cv.glmnet(train.x, train.y, alpha=1,nfolds = 10)
+plot(cv.lasso)
+(best.lambda <- cv.lasso$lambda.min) # 1668.459
+
+# Fit lasso model with the best lambda
+model.lasso <- glmnet(train.x, train.y, alpha = 1, lambda = best.lambda )
+
+coef(fit.lasso, s = best.lambda)
+
+```
+
+
+## DECISION TREE AND RANDOM FOREST AND BOOSTING
+
+# DECISION TREE
+```{r}
+library(tree)
+
+
+# Train data set (80%), and test data set (20%)
+set.seed(9999)
+train.rows = sample(1:nrow(melhouse), nrow(melhouse)*0.8)
+
+tree_features <-  c("Price" ,"Rooms", "Bathroom","Car","Distance","Landsize",
+              "Propertycount","Lattitude","Longtitude", "Year", "Type")
+
+data.tree <- melhouse[,tree_features]
+train.tree <- melhouse[train.rows,tree_features]
+test.tree <- melhouse[-train.rows,tree_features]
+
+# TREE INDUCTION USING DEVIANCE  
+# Build tree with 10 folds cross-validation
+model.tree = tree(log(Price)~ ., train.tree)
+(t1 <- format(Sys.time()))
+cv = cv.tree(model.tree,K=10)
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0.03333333 mins
+
+help(tree)
+
+qplot(cv$size, cv$dev) + geom_line(colour="blue", size=1)
+cv$size[which.min(cv$dev)]
+
+prune.tree <- prune.tree(model.tree, best=cv$size[which.min(cv$dev)])
+
+options(digits=7)
+{plot(prune.tree)
+text(prune.tree, pretty=0)}
+options(digits=7)
+# Train MSE
+predict.train = predict(prune.tree, newdata=train.tree)
+(train.mse.tree <- mean((predict.train - log(train.tree$Price))^2)) # 0.09249374
+
+# Test MSE
+predict.test = predict(prune.tree, newdata=test.tree)
+(test.mse.tree <- mean((predict.test - log(test.tree$Price))^2)) # 0.0984932
+
+
+```
+# RANDOM FOREST
+```{r}
+
+library(randomForest)
+
+testrf <- data.tree[1:5000,]
+testrf.rows = sample(1:nrow(testrf), nrow(testrf)*0.8)
+
+(t1 <- format(Sys.time()))
+model.rf = randomForest(log(Price) ~ ., data = testrf, subset=testrf.rows,
+                        mtry=10, importance=TRUE )
+# rdfr_model <- randomForest(Quality_of_life_measure ~ ., data = trainX,ntree=500,mtry=6, importance = TRUE)
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins"))
+
+# Impotance of each prdictors
+importance(model.rf)
+varImpPlot(model.rf)
+
+# model.rf = randomForest(log(Price) ~ ., data = data.tree, subset=train.rows,
+#                         mtry=10, importance=TRUE )
+
+# Train MSE
+# predict.train = predict(model.rf, newdata=data.tree[train.rows,])
+# mean((predict.train - log(data.tree[train.rows,"Price"]))^2)
+# Test MSE
+# predict.test = predict(model.rf, newdata=data.tree[-train.rows,])
+# mean((predict.test - log(data.tree[-train.rows,"Price"]))^2)
+
+```
+
+
+
+# BOOSTING
+
+```{r}
+library(gbm)
+
+# 100 tree
+(t1 <- format(Sys.time()))
+model.boost = gbm(log(Price) ~ ., data=train.tree, distribution="gaussian",
+        n.trees=100, interaction.depth=4)
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0.2833333 mins
+
+summary(model.boost)
+
+#ggplot(aes(x=summary(model.boost)$rel.inf, y=summary(model.boost)$var))
+
+# Train MSE
+predict.train = predict(model.boost, newdata=train.tree, n.trees = 100)
+mean((predict.train - log(data.tree[train.rows,"Price"]))^2) # 0.2409691
+# Test MSE
+predict.test = predict(model.boost, newdata=test.tree,n.trees = 100)
+mean((predict.test - log(data.tree[-train.rows,"Price"]))^2) # 0.2500432
+
+
+# 1000 trees
+(t1 <- format(Sys.time()))
+model.boost = gbm(log(Price) ~ ., data=train.tree, distribution="gaussian",
+        n.trees=1000, interaction.depth=4)
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0.2833333 mins
+
+summary(model.boost)
+
+#ggplot(aes(x=summary(model.boost)$rel.inf, y=summary(model.boost)$var))
+
+# Train MSE
+predict.train = predict(model.boost, newdata=train.tree, n.trees = 1000)
+mean((predict.train - log(data.tree[train.rows,"Price"]))^2) # 0.1300673
+# Test MSE
+predict.test = predict(model.boost, newdata=test.tree,n.trees = 1000)
+mean((predict.test - log(data.tree[-train.rows,"Price"]))^2) # 0.1372626
+
+
+
+```
+
+
+# SIMPLE LINEAR REGESSION
+```{r}
+
+mhouse <- melhouse[,c("Price","Type","Rooms","Distance","Longtitude","Lattitude")]
+mhouse$Type <- as.numeric(mhouse$Type)
+# Train data set (80%), and test data set (20%)
+set.seed(9999)
+train.rows = sample(1:nrow(mhouse), nrow(mhouse)*0.8)
+
+(t1 <- format(Sys.time()))
+model.lm <- lm(log(Price)~.,data = mhouse[train.rows,])
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0 mins
+# Get train mse
+predict.train <-(predict(model.lm, mhouse[train.rows,]))
+(train.mse.lm <- mean((predict.train - log(mhouse[train.rows,"Price"]))^2)) # 0.0948133
+# Get test mse
+predic.test <-(predict(model.lm, mhouse[-train.rows,]))
+(test.mse.lm <- mean((predic.test - log(mhouse[-train.rows,"Price"]))^2)) # 0.09942248
+```
+
+# POLYNOMIAL REGRESSION
+
+```{r, fig.height=4, fig.width=4}
+library(boot)
+
+degree=1:5
+cv.error10=rep(0,5)
+for(d in degree){
+  model.glm.fit=glm(log(Price)~ Type + poly(Rooms,d) + poly(Distance,d) + 
+                    poly(Longtitude,d) + poly(Lattitude,d) , data=mhouse[train.rows,])
+  cv.error10[d]=cv.glm(mhouse[train.rows,],model.glm.fit,K=10)$delta[1]
+}
+{plot(degree,cv.error10,type="b",col="red")}
+
+(d <- which.min(cv.error10)) # 3
+# Fit best polynominal model
+(t1 <- format(Sys.time()))
+model.glm.fit=glm(log(Price)~ Type + poly(Rooms,d) + poly(Distance,d) + 
+                    poly(Longtitude,d) + poly(Lattitude,d) , data=mhouse[train.rows,])
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0 mins
+
+# Get train mse
+predict.train <-(predict(model.glm.fit, mhouse[train.rows,]))
+(train.mse.lm <- mean((predict.train - log(mhouse[train.rows,"Price"]))^2)) # 0.07731395
+# Get test mse
+predic.test <-(predict(model.glm.fit, mhouse[-train.rows,]))
+(test.mse.lm <- mean((predic.test - log(mhouse[-train.rows,"Price"]))^2)) # 0.08321804
+
+
+```
+
+
+# SUPPORT VECTOR MACHINE
+```{r}
+library(e1071)
+# Fit svm model
+(t1 <- format(Sys.time()))
+model.svm <- svm(log(Price) ~ ., data = mhouse[train.rows,], 
+                 cost=10, gamma=0.1, scale=TRUE, kernel="radial")
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 1.583333 mins
+
+
+summary(model.svm) # Number of Support Vectors:  12842
+# Train mse
+predict.train <-(predict(model.svm, mhouse[train.rows,]))
+(train.mse.svm <- mean((predict.train - log(mhouse[train.rows,"Price"]))^2)) # 0.05584752
+# Test mse
+predict.test <-(predict(model.svm, mhouse[-train.rows,]))
+(test.mse.svm <-  mean((predict.test - log(mhouse[-train.rows,"Price"]))^2)) # 0.06154658
+
+# # Tune svm model
+# mtrain <- mhouse[train.rows,]
+# (t1 <- format(Sys.time()))
+# cv.svm <- tune.svm(log(Price)~., data = mtrain[1:1000,],kernel="radial", scale=TRUE,
+#                gamma = 10^(-3:1), cost = 10^(-1:4))
+# (t2 <- format(Sys.time()))
+# (difftime(t2,t1,units="mins")) # 31.23333 mins for 1000 observations
+# 
+# cv.svm
+
+# - best parameters: 1000 observations
+#  gamma cost
+#      1    1
+     
+
+# Fit best parameters into svm model
+(t1 <- format(Sys.time()))
+model.svm <- svm(log(Price) ~ ., data = mhouse[train.rows,], 
+                 cost=1, gamma=1, scale=TRUE, kernel="radial")
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 1.4 mins
+
+summary(model.svm) # Number of Support Vectors:  12599
+# Train mse
+predict.train <-(predict(model.svm, mhouse[train.rows,]))
+(train.mse.svm <- mean((predict.train - log(mhouse[train.rows,"Price"]))^2)) # 0.0480098
+# Test mse
+predict.test <-(predict(model.svm, mhouse[-train.rows,]))
+(test.mse.svm <-  mean((predict.test - log(mhouse[-train.rows,"Price"]))^2)) # 0.05610264
+
+
+```
+
+
+
+# NEURAL NETWORK
+```{r}
+library(neuralnet)
+
+# Fit neural network
+# note that full formula needs to be written for neuralnet
+# and outcome has to be in numerical format
+(t1 <- format(Sys.time()))
+set.seed(12345)
+mmodel.nn <- neuralnet(log(Price) ~ Type + Rooms + Distance + Longtitude + Lattitude, 
+               data = mhouse[train.rows,], hidden =  c(4,3), err.fct = "sse")  
+# try others e.g. hidden = c(2,1)
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 0.03333333333 mins
+
+# plot result
+plot(mmodel.nn)
+
+# Train mse
+predict.train <- compute(mmodel.nn, mhouse[train.rows,-1]) 
+head(predict.train$net.result)
+
+(train.mse.nn <- mean((predict.train$net.result - log(mhouse[train.rows,"Price"]))^2)) # 0.2656855446
+# Test mse
+predict.test <- compute(mmodel.nn, mhouse[-train.rows,-1]) 
+(test.mse.svm <-  mean((predict.test$net.result - log(mhouse[-train.rows,"Price"]))^2)) # 0.2749224332
+
+
+(t1 <- format(Sys.time()))
+set.seed(12345)
+  mmodel.nn <- neuralnet(log(Price) ~ Type + Rooms + Distance + Longtitude + Lattitude, 
+               data = mhouse[train.rows,], hidden =  c(2,3), err.fct = "sse")  
+  predict.train <- compute(mmodel.nn, mhouse[train.rows,-1]) 
+  
+  (mean((predict.train$net.result - log(mhouse[train.rows,"Price"]))^2))
+
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins"))
+ plot(mmodel.nn) 
+  
+
+hidden_layer = 1:3
+cv.errors=rep(0,6)
+for(d in hidden_layer){
+  mmodel.nn <- neuralnet(log(Price) ~ Type + Rooms + Distance + Longtitude + Lattitude, 
+               data = mhouse[train.rows,], hidden =  c(d,d), err.fct = "sse")  
+  predict.train <- compute(mmodel.nn, mhouse[train.rows,-1]) 
+  
+  cv.errors[d]= mean((predict.train$net.result - log(mhouse[train.rows,"Price"]))^2)
+}
+{plot(hidden_layer,cv.errors[1:4],type="b",col="red")}
+
+
+# ## Use different library
+# library(nnet)
+# 
+# set.seed(12345)
+# nn <- nnet(log(Price)~., data= mhouse[train.rows,], size=2)
+# 
+# names(nn)
+# summary(nn)
+# names(summary(nn))
+# head(nn$fitted.values)
+# 
+# # Train mse
+# predict.train <- predict(nn,newdata = mhouse[train.rows,])
+# head(predict.train)
+# (train.mse.nn <- mean((predict.train - log(mhouse[train.rows,"Price"]))^2)) # 0.2656855446
+# 
+# # Test mse
+# predict.test <- compute(mmodel.nn, mhouse[-train.rows,-1]) 
+# (test.mse.svm <-  mean((predict.test$net.result - log(mhouse[-train.rows,"Price"]))^2)) # 0.2749224332
+
+
+
+```
+
+
+
+
+# PCA
+```{r}
+# Compute the principal components of the training data BostonTrainX after scaling
+pca.o <- prcomp(mhouse.trainX[,-1],scale=TRUE,center=TRUE)
+# Explore PCA results
+pca.o
+summary(pca.o)
+names(pca.o)
+pca.o$scale
+pca.o$center
+pca.o$rotation[,1:2]
+# Biplot of PCA output
+biplot(pca.o,scale=0)
+# The proportion of variance explained by each component
+(proportions <- (pca.o$sdev^2)/sum(pca.o$sdev^2))
+# The proportion of variance explained by the first TWO components
+proportions[1:5] # 0.4765353 0.1100670
+sum(proportions[1:5])  # 0.5866024
+
+# SCREE PLOTS
+impota <- summary(pca.o)$importance
+# Get the proportion of variance and cumulative proportion of variance explained
+df.prop <- data.frame(pca.component=1:ncol(impota),
+                      proportion.of.variance=impota[2,],
+                      cumulative.proportion=impota[3,])
+
+# Scree plot of the proportion of variance explained
+ggplot() + 
+  geom_point(aes(x=df.prop$pca.component,y=df.prop$proportion.of.variance,color="proportion"))+
+  geom_line(aes(x=df.prop$pca.component,y=df.prop$proportion.of.variance,color="proportion")) +
+  labs(title ="Scree plots of the proportion of variance explained", x = "Number of principal components", y = "the proportion of variance explained")
+# Scree plot of the cumulative proportion of variance explained
+ggplot() + 
+  geom_point(aes(x=df.prop$pca.component,y=df.prop$cumulative.proportion,color="cumulative"))+
+  geom_line(aes(x=df.prop$pca.component,y=df.prop$cumulative.proportion,color="cumulative")) +
+  labs(title ="Scree plots of the cumulative proportion of variance explained", x = "Number of principal components", y = "The cumulative proportion of Variance")
+
+
+# Get train data of components and add Price column to new train data set 
+mhouse.train.pca <- data.frame(predict(pca.o)[,1:5],Price=mhouse.trainX[,"Price"])
+mhouse.train.pca <- data.frame(predict(pca.o)[,1:6],Price=mhouse.trainX[,"Price"])
+# Get test data with the principal components 
+mhouse.test.pca <- data.frame(data.frame(predict(pca.o, newdata=mhouse.testX[,-1]))[,1:5],
+                              Price=mhouse.testX[,"Price"])
+mhouse.test.pca <- data.frame(data.frame(predict(pca.o, newdata=mhouse.testX[,-1]))[,1:6],
+                              Price=mhouse.testX[,"Price"])
+
+```
+
+
+# SUPPORT VECTOR MACHINE + PCA
+```{r}
+library(e1071)
+
+# Fit svm model
+(t1 <- format(Sys.time()))
+model.svm <- svm(log(Price) ~ ., data = mhouse.train.pca, 
+                 cost=10, gamma=0.1, scale=TRUE, kernel="radial")
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 1.716667 mins
+
+
+summary(model.svm) # Number of Support Vectors:  13402
+# Train mse
+predict.train <-(predict(model.svm, mhouse.train.pca))
+(train.mse.svm <- mean((predict.train - log(mhouse.train.pca[,"Price"]))^2)) # 0.05584752 => 0.07208906
+# Test mse
+predict.test <-(predict(model.svm, mhouse.test.pca[,-7]))
+(test.mse.svm <-  mean((predict.test - log(mhouse.test.pca[,"Price"]))^2)) # 0.06154658 => 0.08098139
+
+# Tune svm model
+(t1 <- format(Sys.time()))
+cv.svm <- tune.svm(log(Price)~., data = mhouse.train.pca[1:1000,],kernel="radial", scale=TRUE,
+               gamma = 10^(-3:1), cost = 10^(-1:4))
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 30.45 mins for 1000 observations
+
+cv.svm
+
+# - best parameters: 1000 observations
+#  gamma cost
+#      0.1   10
+     
+(t1 <- format(Sys.time()))
+model.svm <- svm(log(Price) ~ ., data = mhouse.train.pca, 
+                 cost=1, gamma=1, scale=TRUE, kernel="radial")
+(t2 <- format(Sys.time()))
+(difftime(t2,t1,units="mins")) # 1.716667 mins
+
+
+summary(model.svm) # Number of Support Vectors:  13032
+# Train mse
+predict.train <-(predict(model.svm, mhouse.train.pca))
+(train.mse.svm <- mean((predict.train - log(mhouse.train.pca[,"Price"]))^2)) # 0.05584752 => 0.07208906 => 0.0473887
+# Test mse
+predict.test <-(predict(model.svm, mhouse.test.pca[,-7]))
+(test.mse.svm <-  mean((predict.test - log(mhouse.test.pca[,"Price"]))^2)) # 0.06154658 => 0.08098139 => 0.07280777
+
+
+```
+
+
+
+# CHECK PREVIOUS MODEL ON KAGGLE 
+https://www.kaggle.com/anthonypino/melbourne-housing-market/kernels
+https://www.kaggle.com/zillow/zecon/kernels
+
+
+
+<!-- Key point being, though, that we form the folds before we filter or fit to the data. -->
+<!-- So that we're applying cross-validation to the entire process, not just the second step. -->
+
+
+# So the one standard error rule, which is pretty popular now, is not use the model with the absolute minimum.
+# But use a simpler model that comes within one standard deviation of the minimum.
+# So the rationale for this, again I've said it, is that if the models are within one standard error of each other,
+# let's choose the simplest one. Because it's easier to interpret.
+
+So the one standard error rule says-- remember this is the number of predictors along the horizontal axis.
+Says don't choose the minimum.
+But take the simplest model that comes within one standard error of the minimum.
+
+If the models are within one standard error of each other, let's choose the simplest one.
+Because it's easier to interpret.
